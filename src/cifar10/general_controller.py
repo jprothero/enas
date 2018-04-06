@@ -77,10 +77,121 @@ class GeneralController(Controller):
     self.num_replicas = num_replicas
     self.name = name
 
-    self._create_params()
-    self._build_sampler()
+    class AlphaZero:
+      def __init__(self):
+        self.root_node = {
+          "children": []
+        }
+        self.curr_node = self.root_node
 
-    self.alphazero = create_alphazero()
+      def uct_choice(self, curr_node): return curr_node["children"][curr_node["max_uct"]]
+
+      def select(self, root_node):
+          curr_node = root_node
+
+          while curr_node.children is not None:
+              curr_node = self.uct_choice(curr_node)
+
+          return curr_node
+
+
+      def U_func(self, P, N): return P/(1+N)
+
+
+      def Q_func(self, W, N): return W/N
+
+
+      def backup(self, expanded_node, value):
+          node = expanded_node
+          while node["parent"] is not None:
+              node = self.update_node(node, value)
+              node = node["parent"]
+
+          return node
+
+
+      def update_node(self, node, value):
+          node["N"] += 1
+          node["W"] += value
+          node["Q"] = self.Q_func(W=node["W"], N=node["N"])
+          node["U"] = self.U_func(P=node["P"], N=node["N"])
+          UCT = node["Q"] + node["U"]
+          if UCT > node["parent"]["max_uct"]["score"]:
+              node["parent"]["max_uct"]["score"] = UCT
+              node["parent"]["max_uct"]["idx"] = node["idx"]
+
+          return node
+
+
+      def expand(self, curr_node, policy, value):
+          curr_node["children"] = []
+          curr_node["max_uct"] = {}
+
+          max_U = 0
+          max_U_idx = None
+
+          for i, p in enumerate(policy):
+              U = self.U_func(p, 0)
+
+              child = {
+                  "N": 0,
+                  "W": 0,
+                  "Q": 0,
+                  "U": U,
+                  "P": p,
+                  "parent": curr_node,
+                  "idx": i
+              }
+
+              curr_node["children"].append(child)
+
+              if U > max_U:
+                  max_U = U
+                  max_U_idx = i
+
+          curr_node["max_uct"] = {
+              "score": max_U, "idx": max_U_idx
+          }
+
+          return curr_node, value
+
+
+      def choose_real_move(self, node):
+          child_visits_probas = node["child_visits"]/node["child_visits"].sum()
+
+          action = np.random.choice(
+              node["child_visits"], p=child_visits_probas)
+
+          return action, child_visits_probas
+
+    #So I dont have time to do this right now
+    #the idea is basically have a self.AZ which has the alpha zero methods
+    #run build sampler NUM_SIMS times
+    #whenever you hit a decision expand, backpropagate, and stay on the same node,
+    #then use UCT to select the best node (alternative is we can do a random choice)
+    #with the probas, but this is fine for now
+
+    #in theory it should just work because it will follow the decision flow of the program
+    #the num children will change dynamically based on the policy size, and on subsequent
+    #runs of build sampler we will have stronger search probas, and use them 
+    #to improve the base policy
+
+    self.az = AlphaZero()
+
+
+    self.root_node = {
+      "children": None
+      , "parent": None
+      , "itrs": 0
+      , "N": 0.0
+    }
+
+    self._create_params()
+
+    NUM_SIMS=10
+    for _ in range(NUM_SIMS):
+      self._build_sampler()
+    self._build_sampler(visits=True)
 
   def _create_params(self):
     initializer = tf.random_uniform_initializer(minval=-0.1, maxval=0.1)
@@ -120,15 +231,102 @@ class GeneralController(Controller):
               self.w_soft["count"].append(tf.get_variable(
                 "w_count", [self.lstm_size, self.out_filters - 1]));
 
-        with tf.variable_scope("critic"):
-          self.w_critic = tf.get_variable("w", [self.lstm_size, 1])
+      with tf.variable_scope("critic"):
+        self.w_critic = tf.get_variable("value", [self.lstm_size, 1])
 
       with tf.variable_scope("attention"):
         self.w_attn_1 = tf.get_variable("w_1", [self.lstm_size, self.lstm_size])
         self.w_attn_2 = tf.get_variable("w_2", [self.lstm_size, self.lstm_size])
         self.v_attn = tf.get_variable("v", [self.lstm_size, 1])
+  
+  def single_select(self, curr_node, visits):
+    if not visits:
+      if curr_node["children"] is not None:
 
-  def _build_sampler(self):
+        ucts = [child["uct"] for child in curr_node["children"]]
+        ucts = tf.stack(ucts)
+        idx = tf.argmax(ucts)
+        with tf.Session() as sess:
+          curr_node = curr_node["children"][idx.eval()]
+        # curr_node = tf.gather(curr_node["children"], tf_look_up[idx])
+      else:
+        idx = None
+    else:
+      idx = tf.argmax(curr_node["children"]["N"])
+      curr_node = curr_node["children"][idx]
+    
+    return curr_node, idx
+
+  def expand(self, curr_node, logit):
+    curr_node["children"] = [] 
+  
+    # curr_node["policy"]
+    policy = tf.nn.softmax(logit)
+
+    policy_dim = policy.get_shape().as_list()[0]
+
+    for i in enumerate(range(policy_dim)):
+        child = {
+            "N": 0,
+            "W": 0,
+            "Q": 0,
+            "U": policy[i],
+            "P": policy[i],
+            "uct": policy[i],
+            "children": None,
+            "parent": curr_node,
+        }
+
+        curr_node["children"].extend([child])
+    
+    return curr_node
+
+  # def expand(self, curr_node, logit):
+  #   curr_node["children"] = []
+
+  #   policy =  tf.nn.softmax(logit)
+
+  #   for i, p in enumerate(policy):
+  #       child = {
+  #           "N": 0,
+  #           "W": 0,
+  #           "Q": 0,
+  #           "U": p,
+  #           "P": p,
+  #           "uct": p,
+  #           "children": None,
+  #           "parent": curr_node,
+  #       }
+
+  #       curr_node["children"].extend([child])
+    
+  #   return curr_node
+
+  def backup(self, curr_node, value, c=1):
+    while curr_node["parent"] is not None:
+      curr_node["N"] += 1.
+      curr_node["W"] += value
+      curr_node["Q"] = curr_node["W"]/curr_node["N"]
+      curr_node["U"] = c*curr_node["P"]*tf.log(curr_node["parent"]["N"])/(1 + curr_node["N"])
+      curr_node["uct"] = curr_node["Q"] + curr_node["U"]
+
+      curr_node = curr_node["parent"]
+
+    return curr_node
+
+  # def backup(self, curr_node, value):
+  #   while curr_node["parent"] is not None:
+  #     curr_node["N"] += 1
+  #     curr_node["W"] += value
+  #     curr_node["Q"] = curr_node["W"]/curr_node["N"]
+  #     curr_node["U"] = c*curr_node["P"]*np.log(curr_node["parent"]["N"])/(1 + curr_node["N"])
+  #     curr_node["uct"] = Q + U
+
+  #     curr_node = curr_node["parent"]
+
+  #   return curr_node
+
+  def _build_sampler(self, visits=False):
     """Build the sampler ops and the log_prob ops."""
 
     print "-" * 80
@@ -136,12 +334,17 @@ class GeneralController(Controller):
     anchors = []
     anchors_w_1 = []
 
+    if self.root_node is not None:
+      self.root_node["itrs"] += 1
+
+    curr_node = self.root_node
+
     arc_seq = []
     entropys = []
     log_probs = []
-    probs = []
     skip_count = []
     skip_penaltys = []
+
     all_h = []
 
     prev_c = [tf.zeros([1, self.lstm_size], tf.float32) for _ in
@@ -156,13 +359,23 @@ class GeneralController(Controller):
         next_c, next_h = stack_lstm(inputs, prev_c, prev_h, self.w_lstm)
         prev_c, prev_h = next_c, next_h
         logit = tf.matmul(next_h[-1], self.w_soft)
+        all_h.append(tf.stop_gradient(next_h[-1]))
+        
+        curr_node, branch_id = self.single_select(curr_node, visits)
+        if branch_id is None:
+          all_h = tf.concat(all_h, axis=0)
+          value = tf.matmul(all_h, self.w_critic)
+          probas = tf.nn.softmax(logit)
+          curr_node = self.expand(curr_node, logit)
+          root_node = self.backup(curr_node, value)
+          return
         if self.temperature is not None:
           logit /= self.temperature
         if self.tanh_constant is not None:
           logit = self.tanh_constant * tf.tanh(logit)
         if self.search_for == "macro" or self.search_for == "branch":
-          branch_id = tf.multinomial(logit, 1)
-          branch_id = tf.to_int32(branch_id)
+          # branch_id = tf.multinomial(logit, 1)
+          # branch_id = tf.to_int32(branch_id)
           branch_id = tf.reshape(branch_id, [1])
         elif self.search_for == "connection":
           branch_id = tf.constant([0], dtype=tf.int32)
@@ -172,55 +385,50 @@ class GeneralController(Controller):
         log_prob = tf.nn.sparse_softmax_cross_entropy_with_logits(
           logits=logit, labels=branch_id)
         log_probs.append(log_prob)
-        probs.append(tf.nn.softmax(logit))
         entropy = tf.stop_gradient(log_prob * tf.exp(-log_prob))
         entropys.append(entropy)
         inputs = tf.nn.embedding_lookup(self.w_emb, branch_id)
       else:
         for branch_id in xrange(self.num_branches):
           next_c, next_h = stack_lstm(inputs, prev_c, prev_h, self.w_lstm)
-          all_h.append(tf.stop_gradient(next_h[-1]))
           prev_c, prev_h = next_c, next_h
           logit = tf.matmul(next_h[-1], self.w_soft["start"][branch_id])
-          #so this is the point where the logit is produced...
-          #the idea is we need to take that logit, use the probabilities to search 
-          #for the next option, etc.
-          #so do do this I think we might need to experiment with putting this stuff in functions
+          all_h.append(tf.stop_gradient(next_h[-1]))
+          
+          curr_node, start = self.single_select(curr_node, visits)
+          if start is None:
+            all_h = tf.concat(all_h, axis=0)
+            value = tf.matmul(all_h, self.w_critic)
+            probas = tf.nn.softmax(logit)
+            curr_node = self.expand(curr_node, logit)
+            root_node = self.backup(curr_node, value)
+            return
           if self.temperature is not None:
             logit /= self.temperature
           if self.tanh_constant is not None:
             logit = self.tanh_constant * tf.tanh(logit)
-          #okay so this is where the logit
-          start = tf.multinomial(logit, 1)
-          start = tf.to_int32(start)
+          # start = tf.multinomial(logit, 1)
+          # start = tf.to_int32(start)
           start = tf.reshape(start, [1])
           arc_seq.append(start)
           log_prob = tf.nn.sparse_softmax_cross_entropy_with_logits(
             logits=logit, labels=start)
           log_probs.append(log_prob)
-          probs.append(tf.nn.softmax(logit))
           entropy = tf.stop_gradient(log_prob * tf.exp(-log_prob))
           entropys.append(entropy)
           inputs = tf.nn.embedding_lookup(self.w_emb["start"][branch_id], start)
 
-          #so how would this change.... as of right now the net just predicts
-          #what it would do for each decision, and it uses some losses on them
-          #alphazero uses an mcts structure to look into the future and
-          #use the policy and value to make a stronger prediction about what to do
-          #so basically I need to replace the existing loss with an MCTS loss,
-          #and I need to replace the existing decisions with MCTS decisions
-
-          #I could probably for now just have the alpha zero be a policy improvement
-          #i.e. it would just be a policy loss function and we wouldn't care
-          #about using the improved search probabilities immediately, which would be
-          #more complicated. 
-          #so basically we would just defined an alphazero structure here 
-          #get the improved search probabilities, and do a cross entropy loss
-          #between them and the log probabilities
-
           next_c, next_h = stack_lstm(inputs, prev_c, prev_h, self.w_lstm)
           prev_c, prev_h = next_c, next_h
           logit = tf.matmul(next_h[-1], self.w_soft["count"][branch_id])
+          all_h.append(tf.stop_gradient(next_h[-1]))
+          curr_node, count = self.single_select(curr_node, visits)
+          if count is None:
+            all_h = tf.concat(all_h, axis=0)
+            value = tf.matmul(all_h, self.w_critic)
+            curr_node = self.expand(curr_node, logit)
+            root_node = self.backup(curr_node, value)
+            return
           if self.temperature is not None:
             logit /= self.temperature
           if self.tanh_constant is not None:
@@ -229,21 +437,13 @@ class GeneralController(Controller):
           mask = tf.reshape(mask, [1, self.out_filters - 1])
           mask = tf.less_equal(mask, self.out_filters-1 - start)
           logit = tf.where(mask, x=logit, y=tf.fill(tf.shape(logit), -np.inf))
-          #so lets assume that logit at this is batch_size, out_filters
-          #so in theory we can pass the logit to a softmax and sent it to the alphazero
-          #function. 
-
-          self.probas = tf.nn.softmax(logit)
-          self.all_h = all_h
-
-          count = tf.multinomial(logit, 1)
-          count = tf.to_int32(count)
+          # count = tf.multinomial(logit, 1)
+          # count = tf.to_int32(count)
           count = tf.reshape(count, [1])
           arc_seq.append(count + 1)
           log_prob = tf.nn.sparse_softmax_cross_entropy_with_logits(
             logits=logit, labels=count)
           log_probs.append(log_prob)
-          probs.append(tf.nn.softmax(logit))
           entropy = tf.stop_gradient(log_prob * tf.exp(-log_prob))
           entropys.append(entropy)
           inputs = tf.nn.embedding_lookup(self.w_emb["count"][branch_id], count)
@@ -274,7 +474,7 @@ class GeneralController(Controller):
         log_prob = tf.nn.sparse_softmax_cross_entropy_with_logits(
           logits=logit, labels=skip)
         log_probs.append(tf.reduce_sum(log_prob, keep_dims=True))
-        probs.append(tf.nn.softmax(logit))
+
         entropy = tf.stop_gradient(
           tf.reduce_sum(log_prob * tf.exp(-log_prob), keep_dims=True))
         entropys.append(entropy)
@@ -299,13 +499,13 @@ class GeneralController(Controller):
     log_probs = tf.stack(log_probs)
     self.sample_log_prob = tf.reduce_sum(log_probs)
 
-    self.probs = tf.stack(probs)
-
     skip_count = tf.stack(skip_count)
     self.skip_count = tf.reduce_sum(skip_count)
 
     skip_penaltys = tf.stack(skip_penaltys)
     self.skip_penaltys = tf.reduce_mean(skip_penaltys)
+
+    self.all_h = all_h
 
   def build_trainer(self, child_model):
     child_model.build_valid_rl()
@@ -313,56 +513,13 @@ class GeneralController(Controller):
                       tf.to_float(child_model.batch_size))
     self.reward = self.valid_acc
 
-    # normalize = tf.to_float(self.num_layers * (self.num_layers - 1) / 2)
-    # self.skip_rate = tf.to_float(self.skip_count) / normalize
-
     all_h = tf.concat(self.all_h, axis=0)
-
     value_function = tf.matmul(all_h, self.w_critic)
     advantage = value_function - self.reward
     critic_loss = tf.reduce_sum(advantage ** 2)
 
-    #so in theory value_function is the values
-    #and we can get the probas through the softmax of the logits
-
-    #do alphazero stuff here
-
-    # self.alphazero_loss = tf.matmul(search_probas, self.sample_log_probs)
-    # self.loss = 
-
-    class AlphaZero:
-      def __init__(self, num_sims=20):
-        self.num_sims = 20
-
-        self.N = []
-        self.W = []
-        self.U = []
-        self.Q = []
-
-        self.trajectory = []
-      
-      def search(self, probas, values):
-        #so lets see... this is kind of reliant on the assumption that choices are made
-        #sequentially and we can continuously evaluate them with the controller
-        for _ in range(self.num_sims):
-          for b_idx, probas, value in enumerate(zip(probas, values)):
-            np.random.choice(len(probas), p=probas)
-      
-
-
-      for _ in range(num_sims):
-        leaf_node = self.select(root_node)
-
-    self.alphazero.mcts_step(probs, value_function)
-    self.alphazero(probs, value_function)
-
-    
-    self.sample_probs()
-
-    # self.loss = -tf.reduce_mean(self.sample_log_probs * advantage)
-
     critic_train_step = tf.Variable(
-          0, dtype=tf.int32, trainable=False, name="critic_train_step")
+        0, dtype=tf.int32, trainable=False, name="critic_train_step")
     critic_train_op, _, _, _ = get_train_ops(
       critic_loss,
       [self.w_critic],
@@ -374,37 +531,30 @@ class GeneralController(Controller):
       optim_algo="adam",
       sync_replicas=False)
 
-    #so what I need to do is point the input function to alpha zero and run 
-    #a sequence, so that we take a state and we output a policy and value
+    normalize = tf.to_float(self.num_layers * (self.num_layers - 1) / 2)
+    self.skip_rate = tf.to_float(self.skip_count) / normalize
 
-    # if self.entropy_weight is not None:
-    #   self.reward += self.entropy_weight * self.sample_entropy
+    if self.entropy_weight is not None:
+      self.reward += self.entropy_weight * self.sample_entropy
 
-    # self.sample_log_prob = tf.reduce_sum(self.sample_log_prob)
-    # self.baseline = tf.Variable(0.0, dtype=tf.float32, trainable=False)
-    #so 0 - 1
-    #so up to -1 loss, i.e. max loss is reward = 0
-    #they scale it then be 
+    self.sample_log_prob = tf.reduce_sum(self.sample_log_prob)
+    
+    self.baseline = tf.Variable(0.0, dtype=tf.float32, trainable=False)
+    baseline_update = tf.assign_sub(
+      self.baseline, (1 - self.bl_dec) * (self.baseline - self.reward))
 
-    #hmmm Idk seems like theyre doing a discoutn thing
-    #so maybe the baseline changes over time based on the difference, and 
-    #1 - self.bl_dec is the rate of change
-    # baseline_update = tf.assign_sub(
-    #   self.baseline, (1 - self.bl_dec) * (self.baseline - self.reward))
+    with tf.control_dependencies([baseline_update]):
+      self.reward = tf.identity(self.reward)
 
-    # with tf.control_dependencies([baseline_update]):
-    #   self.reward = tf.identity(self.reward)
-
-    #so this is the REINFORCE loss
-    #we want to replace this with alphazero probas and MSE
-    #so the reward is between 0 and 1 and the baseline is too 
-    #1 - 1 = 0
-    #1 - 0 = 1
-    #.7 - 1 = -.3
-    #still dont totally intuitively get this
     # self.loss = self.sample_log_prob * (self.reward - self.baseline)
-    # if self.skip_weight is not None:
-      # self.loss += self.skip_weight * self.skip_penaltys
+    search_probs = np.array([child["N"] for child in self.root_node["children"]])
+    search_probs /= search_probs.sum()
+    search_probs = np.expand_dims(search_probs, -1)
+    search_probs = tf.convert_to_tensor(search_probs, dtype=tf.float32)
+    self.sample_log_prob = tf.expand_dims(self.sample_log_prob, axis=0)
+    self.loss = tf.matmul(search_probs, self.sample_log_prob)
+    if self.skip_weight is not None:
+      self.loss += self.skip_weight * self.skip_penaltys
 
     self.train_step = tf.Variable(
         0, dtype=tf.int32, trainable=False, name="train_step")
